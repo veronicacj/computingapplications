@@ -1,0 +1,413 @@
+import sys
+import os
+import requests
+import pulp
+import numpy as np
+from PyQt6 import uic, QtWidgets
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PyQt6.QtCore import Qt
+#AI was used to optimize preformance speed, reduce API calls, and improve error handling in this code. The optimization process involved:
+#1. Caching API responses for staff, projects, and rates to minimize redundant calls.
+#2. Implementing a safe_request method to handle API errors gracefully and prevent crashes.
+# The program could run super slow and crash if the API was slow or returned errors, so this was crucial for stability.
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        uic.loadUi(os.path.join(os.path.dirname(__file__), 'Stage4_Group5_Final.ui'), self)
+
+        self.staff_cache = {}
+        self.project_cache = {}
+        self.rates_cache = []
+        self.optimization_results = {}
+        self.data_snapshot = None
+
+      
+        self.figure = Figure()
+        self.canvas = FigureCanvas(self.figure)
+        QtWidgets.QVBoxLayout(self.wPie).addWidget(self.canvas)
+
+        self.bar_figure = Figure()
+        self.bar_canvas = FigureCanvas(self.bar_figure)
+        QtWidgets.QVBoxLayout(self.wBar).addWidget(self.bar_canvas)
+
+        
+        self.cbEmployees.currentIndexChanged.connect(self.plot_employee_hours)
+        self.cbEmployees.currentIndexChanged.connect(self.plot_bar_chart)
+        self.btnOptimize.clicked.connect(self.run_optimization)
+        self.cbProjects.currentIndexChanged.connect(self.plot_pie_chart)
+
+        self.figure_hours = Figure()
+        self.canvas_hours = FigureCanvas(self.figure_hours)
+        
+        
+        if self.wHoursBreakdown.layout() is None:
+            QtWidgets.QVBoxLayout(self.wHoursBreakdown)
+        self.wHoursBreakdown.layout().addWidget(self.canvas_hours)
+
+       
+        self.cbProjects.currentIndexChanged.connect(self.plot_hours_breakdown)
+    
+        self.refresh_all_data()
+
+    def safe_request(self, url):
+        """Helper to handle API errors gracefully."""
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"Request Error to {url}: {e}")
+            return None
+
+    def refresh_all_data(self):
+        """Prefetch all static data once to speed up everything else."""
+        staff_list = self.safe_request("https://bit-coursework-api.azurewebsites.net/project/Staff") or []
+        self.staff_cache = {s["staffID"]: s for s in staff_list}
+        
+        project_list = self.safe_request("https://bit-coursework-api.azurewebsites.net/project/Projects") or []
+        self.project_cache = {p["id"]: p for p in project_list}
+        
+        self.rates_cache = self.safe_request("https://bit-coursework-api.azurewebsites.net/project/StaffRates") or []
+        
+        self.populate_employee_combobox()
+        self.populate_project_combobox()
+
+    def get_optimization_data(self):
+        """Prepares data for the solver using the local cache."""
+        all_staff = list(self.staff_cache.values())
+        all_rates = self.rates_cache
+
+        staff_ids = [s["staffID"] for s in all_staff]
+        project_ids = list({r["projectID"] for r in all_rates})
+        base_rate = {s["staffID"]: s["baseRate"] for s in all_staff}
+        classification = {s["staffID"]: s["staffClassificationID"] for s in all_staff}
+
+        rate_lookup = {(r["staffID"], r["projectID"]): r["rate"] for r in all_rates}
+        project_class_pairs = list({(r["projectID"], classification[r["staffID"]]) for r in all_rates})
+
+        total_hours = {}
+        weekly_hours = {}
+
+       
+        total_pairs = len(project_class_pairs)
+        for i, (proj_id, class_id) in enumerate(project_class_pairs):
+            records = self.safe_request(f"https://bit-coursework-api.azurewebsites.net/project/ProjectHours/{proj_id}/{class_id}") or []
+            total_hours[(proj_id, class_id)] = sum(rec["numberHours"] for rec in records)
+            for rec in records:
+                weekly_hours[(proj_id, class_id, rec["weekNum"])] = rec["numberHours"]
+            
+            
+            if total_pairs > 0:
+                api_progress = int(5 + (i / total_pairs * 35))
+                self.progressBar.setValue(api_progress)
+                QtWidgets.QApplication.processEvents()
+
+        weeks = sorted({w for (_, _, w) in weekly_hours.keys()})
+
+        return (staff_ids, project_ids, weeks, rate_lookup, base_rate, 
+                classification, project_class_pairs, total_hours, weekly_hours)
+
+    def run_optimization(self):
+        self.btnOptimize.setEnabled(False)
+        self.btnOptimize.setText("Optimizing...")
+        self.progressBar.show()
+        self.progressBar.setValue(5)
+        QtWidgets.QApplication.processEvents()
+
+       
+        data = self.get_optimization_data()
+        (staff_ids, project_ids, weeks, rate_lookup, base_rate, 
+         classification, pairs, total_hours, weekly_hours) = data
+        self.data_snapshot = data 
+
+        self.progressBar.setValue(45)
+        QtWidgets.QApplication.processEvents()
+
+
+        model = pulp.LpProblem("Staff_Assignment", pulp.LpMinimize)
+        x = {(s, p): pulp.LpVariable(f"x_{s}_{p}", cat="Binary") for s in staff_ids for p in project_ids}
+        non_billable = {s: pulp.LpVariable(f"non_billable_{s}", lowBound=0) for s in staff_ids}
+
+      
+        model += (pulp.lpSum(rate_lookup.get((s, p), 0) * total_hours.get((p, classification[s]), 0) * x[(s, p)] 
+                  for s in staff_ids for p in project_ids) +
+                  pulp.lpSum(0.25 * base_rate[s] * non_billable[s] for s in staff_ids))
+
+        
+        for (p, c) in pairs:
+            model += pulp.lpSum(x[(s, p)] for s in staff_ids if classification[s] == c) == 1
+        for s in staff_ids:
+            for w in weeks:
+                model += pulp.lpSum(weekly_hours.get((p, classification[s], w), 0) * x[(s, p)] for p in project_ids) <= 40
+            model += non_billable[s] >= 480 - pulp.lpSum(total_hours.get((p, classification[s]), 0) * x[(s, p)] for p in project_ids)
+
+        self.progressBar.setValue(65)
+        QtWidgets.QApplication.processEvents()
+
+        
+        if model.solve(pulp.PULP_CBC_CMD(msg=0)) != 1:
+            self.progressBar.hide()
+            QtWidgets.QMessageBox.warning(self, "Optimization", "No optimal solution found.")
+            self.btnOptimize.setEnabled(True)
+            self.btnOptimize.setText("Optimize Assignments")
+            return
+
+        self.progressBar.setValue(90)
+        QtWidgets.QApplication.processEvents()
+
+        
+        self.optimization_results = {}
+        project_staff_names = {}
+
+        for s in staff_ids:
+            assigned = {}
+            for p in project_ids:
+                if pulp.value(x[(s, p)]) == 1:
+                    assigned[p] = total_hours.get((p, classification[s]), 0)
+                    s_info = self.staff_cache.get(s, {})
+                    sname = f"{s_info.get('firstName', '')} {s_info.get('lastName', '')}"
+                    project_staff_names.setdefault(p, []).append(sname)
+            self.optimization_results[s] = assigned
+
+        
+        self.textFinalProjects.clear()
+        for pid, names in sorted(project_staff_names.items()):
+            pname = self.project_cache.get(pid, {}).get("companyName", f"Project {pid}")
+            self.textFinalProjects.append(f"<b>{pname}</b>: {', '.join(names)}")
+
+        self.progressBar.setValue(100)
+        self.btnOptimize.setEnabled(True)
+        self.btnOptimize.setText("Optimize Assignments")
+        self.progressBar.hide()
+
+    def populate_employee_combobox(self):
+        self.cbEmployees.clear()
+        self.cbEmployees.addItem("--Select Employee--", None)
+        for s_id, emp in self.staff_cache.items():
+            self.cbEmployees.addItem(f"{emp['firstName']} {emp['lastName']}", s_id)
+
+    def populate_project_combobox(self):
+        self.cbProjects.clear()
+        self.cbProjects.addItem("--Select Project--", None)
+        for p_id, proj in self.project_cache.items():
+            self.cbProjects.addItem(proj['companyName'], p_id)
+
+    def plot_employee_hours(self):
+        staff_id = self.cbEmployees.currentData()
+        staff_name = self.cbEmployees.currentText()
+
+        
+        if staff_id is None or not self.optimization_results:
+            self.figure.clear()
+            self.canvas.draw()
+            self.textEmployee.clear()
+            self.textAssignedProjects.clear()
+            return
+
+       
+        staff_info = self.staff_cache.get(staff_id, {})
+        
+        assigned_projects_dict = self.optimization_results.get(staff_id, {})
+
+        
+        classification = staff_info.get("staffClassification", {}).get("classification", "N/A")
+        base_rate = staff_info.get("baseRate", 0)
+
+        self.textEmployee.clear()
+        self.textEmployee.append(f"<b>{staff_name}</b>")
+        self.textEmployee.append(f"Classification: {classification}")
+        self.textEmployee.append(f"Base Rate: ${base_rate}")
+
+       
+        self.textAssignedProjects.clear()
+        self.textAssignedProjects.append("<b>Assigned Projects:</b>")
+        
+        if not assigned_projects_dict:
+            self.textAssignedProjects.append("No projects assigned.")
+        else:
+            for project_id, hours in assigned_projects_dict.items():
+                project_info = self.project_cache.get(project_id, {})
+                company_name = project_info.get("companyName", f"Project {project_id}")
+                self.textAssignedProjects.append(f"• {company_name} ({hours} hrs)")
+
+        
+        TOTAL_CAPACITY = 480
+        project_ids = list(assigned_projects_dict.keys())
+        assigned_hours = list(assigned_projects_dict.values())
+        
+        total_assigned = sum(assigned_hours)
+        non_billable = max(0, TOTAL_CAPACITY - total_assigned)
+
+   
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+
+        import matplotlib.cm as cm
+        num_slices = len(project_ids) + (1 if non_billable > 0 else 0)
+        colors = [cm.tab10(i % 10) for i in range(num_slices)]
+
+       
+        labels = []
+        for pid, hours in zip(project_ids, assigned_hours):
+            p_name = self.project_cache.get(pid, {}).get("companyName", f"P{pid}")
+            labels.append(f"{p_name}\n({hours}h)")
+
+        sizes = list(assigned_hours)
+
+        if non_billable > 0:
+            labels.append(f"Non-Billable\n({non_billable}h)")
+            sizes.append(non_billable)
+
+      
+        ax.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, textprops={'fontsize': 7})
+        ax.set_title(f"Hours Allocation for {staff_name}", fontsize=9)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def plot_pie_chart(self):
+        
+        project_id = self.cbProjects.currentData()
+        if project_id is None or not self.optimization_results:
+            return
+
+        p_info = self.project_cache.get(project_id, {})
+        revenue = p_info.get("revenue", 0)
+        self.textProjectDetails.setText(f"{p_info.get('companyName')}\n{p_info.get('industry')}\n${revenue}")
+
+        assigned_staff_ids = [s for s, projs in self.optimization_results.items() if project_id in projs]
+        
+        total_cost = 0
+        self.textAssignedEmployees.clear()
+        for s_id in assigned_staff_ids:
+            s_info = self.staff_cache.get(s_id, {})
+            first_name = s_info.get('firstName', '')
+            last_name = s_info.get('lastName', '')
+            classification_obj = s_info.get('staffClassification')
+            class_name = classification_obj.get('classification')
+
+            self.textAssignedEmployees.append(f"{first_name} {last_name} - {class_name}")
+           
+            rate = next((r["rate"] for r in self.rates_cache if r["staffID"] == s_id and r["projectID"] == project_id), 0)
+            hours = self.optimization_results[s_id].get(project_id, 0)
+            total_cost += (rate * hours)
+
+        self.textCostBreakdown.setText(f"Rev: ${revenue}\nCost: ${total_cost:,.2f}\nProfit: ${revenue - total_cost:,.2f}")
+    
+    def plot_bar_chart(self):
+        import matplotlib.cm as cm
+
+        staff_id = self.cbEmployees.currentData()
+
+       
+        if staff_id is None or not self.optimization_results or self.data_snapshot is None:
+            self.bar_figure.clear()
+            self.bar_canvas.draw()
+            return
+
+        
+        (staff_ids, project_ids, weeks, rate_lookup, base_rate, 
+         classification, pairs, total_hours, weekly_hours) = self.data_snapshot
+
+        
+        assigned_projects = self.optimization_results.get(staff_id, {})
+        class_id = classification.get(staff_id)
+
+        self.bar_figure.clear()
+        ax = self.bar_figure.add_subplot(111)
+
+        if not assigned_projects:
+            ax.text(0.5, 0.5, "No Projects Assigned\n(Run Optimization First)", 
+                    ha="center", va="center")
+            ax.axis("off")
+            self.bar_canvas.draw()
+            return
+
+        
+        week_labels = [f"{w}" for w in weeks]
+        project_list = list(assigned_projects.keys())
+        colors = [cm.tab10(i % 10) for i in range(len(project_list))]
+        bottom_stack = [0.0] * len(weeks)
+
+        
+        for i, pid in enumerate(project_list):
+            
+            hours_per_week = [weekly_hours.get((pid, class_id, w), 0) for w in weeks]
+            
+            p_info = self.project_cache.get(pid, {})
+            p_name = p_info.get("companyName", f"Project {pid}")
+
+            ax.bar(week_labels, hours_per_week, bottom=bottom_stack, 
+                   label=p_name, color=colors[i])
+            
+            
+            bottom_stack = [bottom_stack[j] + hours_per_week[j] for j in range(len(weeks))]
+
+        
+        ax.set_title(f"Weekly Billable Load: {self.cbEmployees.currentText()}", fontsize=10)
+        ax.set_ylabel("Hours")
+        ax.set_xlabel("Weeks")
+        ax.set_ylim(0, 45) # Max 40 hours + a little padding
+        ax.axhline(40, color='red', linestyle='--', alpha=0.5, label="Max Capacity (40h)")
+        
+       
+        ax.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize=8)
+        
+        self.bar_figure.tight_layout()
+        self.bar_canvas.draw()
+
+    def plot_hours_breakdown(self):
+        project_id = self.cbProjects.currentData()
+        
+        if project_id is None or self.data_snapshot is None or not self.optimization_results:
+            self.figure_hours.clear()
+            self.canvas_hours.draw()
+            return
+
+        (staff_ids, project_ids, weeks, rate_lookup, base_rate, 
+         classification, pairs, total_hours, weekly_hours) = self.data_snapshot
+
+        assigned_staff = [s for s, projs in self.optimization_results.items() if project_id in projs]
+        class_ids_in_project = list({classification[s] for s in assigned_staff})
+
+        self.figure_hours.clear()
+        ax = self.figure_hours.add_subplot(111)
+        
+        week_labels = [f"{w}" for w in weeks]
+        x = np.arange(len(weeks))
+        num_classes = len(class_ids_in_project)
+        width = 0.8 / max(num_classes, 1)
+        
+        import matplotlib.cm as cm
+        colors = [cm.tab10(i % 10) for i in range(num_classes)]
+
+        for i, class_id in enumerate(class_ids_in_project):
+            weekly_vals = [weekly_hours.get((project_id, class_id, w), 0) for w in weeks]
+            offset = (i - num_classes / 2) * width + width / 2
+            
+          
+            label = "Unknown"
+            for s in self.staff_cache.values():
+                if s["staffClassificationID"] == class_id:
+                    label = s["staffClassification"]["classification"]
+                    break
+            
+            ax.bar(x + offset, weekly_vals, width, label=label, color=colors[i])
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(week_labels, fontsize=7)
+        ax.set_title(f"Project Staffing: {self.cbProjects.currentText()}", fontsize=9)
+        ax.set_xlabel("Weeks")
+        ax.set_ylabel("Hours")
+        ax.legend(fontsize=7)
+        
+        self.figure_hours.tight_layout()
+        self.canvas_hours.draw()
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
